@@ -39,9 +39,8 @@ if "history" not in st.session_state:
 
 question = st.text_input(
     "Ask a churn question:",
-    value=st.session_state.get("question", ""),
     placeholder="e.g. What plan has the highest churn rate?",
-    key="input",
+    key="question",
 )
 
 col1, col2 = st.columns([1, 8])
