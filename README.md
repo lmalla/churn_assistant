@@ -32,7 +32,7 @@ User Question (Streamlit)
 
 ## Dataset
 
-Synthetic churn data modelled after a Mailchimp/Scribd-style SaaS product.
+Synthetic churn data modelled after a subscription-based SaaS product.
 
 | Column | Type | Description |
 |---|---|---|
