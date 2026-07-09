@@ -65,7 +65,9 @@ churn_assistant/
 ├── build_index.py        # Embed rows → Chroma vector index → chroma_db/
 ├── tools.py              # sql_query() + semantic_search() + Claude tool schemas
 ├── agent.py              # Claude tool_use agent loop
-└── app.py                # Streamlit UI
+├── app.py                # Streamlit UI
+├── test_tools.py         # Tests for sql_query validation, row cap, timeout
+└── test_agent.py         # Tests for agent loop cap + tool-call logging
 ```
 
 ---
@@ -131,6 +133,12 @@ Opens at **http://localhost:8501**
 python agent.py
 ```
 
+### Run the test suite
+
+```bash
+pytest
+```
+
 ---
 
 ## Example Questions
@@ -158,14 +166,42 @@ The agent decides whether to use SQL (precise aggregations) or vector search (pa
 3. Tool results are returned to Claude
 4. Claude synthesizes a final markdown answer
 
-The agent keeps calling tools until Claude returns `stop_reason = "end_turn"`.
+The agent keeps calling tools until Claude returns `stop_reason = "end_turn"`, up to a
+capped number of iterations (`MAX_ITERATIONS = 8` in `agent.py`) so a confused or
+manipulated agent can't loop tool calls indefinitely and run up API cost.
 
 ```
 User ──► Claude ──► tool_use ──► sql_query / semantic_search
                  ◄── tool_result ◄──────────────────────────
-                 ──► (more tool calls if needed)
+                 ──► (more tool calls if needed, capped at 8 rounds)
                  ◄── end_turn: final answer
 ```
+
+Every tool call (name, input, and a truncated result) is logged via the standard
+`logging` module under the `"agent"` logger, so what the agent actually did is
+auditable.
+
+---
+
+## Guardrails on `sql_query`
+
+Since `sql_query` executes SQL that an LLM generated, it's validated before running
+against the DuckDB connection (which is opened `read_only=True`):
+
+- **Single `SELECT`/`WITH` statement only** — no semicolon-chained statements, no
+  DDL/DML/admin keywords (`INSERT`, `DROP`, `ATTACH`, `PRAGMA`, `COPY`, `CALL`, etc.).
+- **Table references are allowlisted, not blocklisted** — every `FROM`/`JOIN` target
+  must be the `churn` table or a CTE defined earlier in the same query. This blocks
+  both known table functions (`read_csv_auto(...)`, `parquet_scan(...)`,
+  `sqlite_scan(...)`) and DuckDB's bare-file shorthand (`FROM '/etc/passwd'`), rather
+  than relying on a keyword list that has to name every dangerous function in advance.
+- **Row cap** — results are truncated to `DEFAULT_ROW_CAP` (200) rows before being
+  returned to the LLM.
+- **Query timeout** — a query running longer than `DEFAULT_TIMEOUT_SECONDS` (10s) is
+  interrupted via `duckdb`'s connection-level `interrupt()`.
+
+See `test_tools.py` for the validation test cases, including the bypass attempts these
+checks are meant to close.
 
 ---
 

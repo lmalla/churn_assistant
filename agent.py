@@ -1,3 +1,4 @@
+import logging
 import os
 from dotenv import load_dotenv
 
@@ -7,8 +8,10 @@ import anthropic
 from tools import TOOLS, TOOL_FNS
 
 client = anthropic.Anthropic()
+logger = logging.getLogger("agent")
 
 MODEL = "claude-haiku-4-5-20251001"
+MAX_ITERATIONS = 8
 
 SYSTEM = """You are a churn analytics assistant for a SaaS company.
 
@@ -28,10 +31,10 @@ Always:
 """
 
 
-def run_agent(question: str) -> str:
+def run_agent(question: str, max_iterations: int = MAX_ITERATIONS) -> str:
     messages = [{"role": "user", "content": question}]
 
-    while True:
+    for _ in range(max_iterations):
         response = client.messages.create(
             model=MODEL,
             max_tokens=2048,
@@ -48,8 +51,10 @@ def run_agent(question: str) -> str:
         tool_results = []
         for block in response.content:
             if block.type == "tool_use":
+                logger.info("tool call: %s(%r)", block.name, block.input)
                 fn = TOOL_FNS[block.name]
                 result = fn(**block.input)
+                logger.info("tool result: %s -> %r", block.name, result[:500])
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -58,6 +63,11 @@ def run_agent(question: str) -> str:
 
         if tool_results:
             messages.append({"role": "user", "content": tool_results})
+
+    return (
+        f"Stopped after {max_iterations} tool-use iterations without a final "
+        "answer. Try narrowing the question."
+    )
 
 
 if __name__ == "__main__":

@@ -1,3 +1,8 @@
+from __future__ import annotations
+
+import re
+import threading
+
 import duckdb
 import chromadb
 from sentence_transformers import SentenceTransformer
@@ -6,6 +11,76 @@ DB_PATH = "data/churn.duckdb"
 CHROMA_PATH = "chroma_db"
 COLLECTION = "churn_users"
 MODEL_NAME = "all-MiniLM-L6-v2"
+
+DEFAULT_ROW_CAP = 200
+DEFAULT_TIMEOUT_SECONDS = 10
+
+# Keywords that would let a query write data, change schema, load extensions,
+# or otherwise act outside a plain read.
+_BLOCKED_KEYWORDS = (
+    "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "TRUNCATE",
+    "ATTACH", "DETACH", "COPY", "PRAGMA", "INSTALL", "LOAD", "CALL",
+    "EXPORT", "IMPORT", "SET", "GRANT", "REVOKE", "VACUUM", "CHECKPOINT",
+    "PREPARE", "EXECUTE", "EXPLAIN",
+)
+_KEYWORD_PATTERN = re.compile(
+    r"\b(" + "|".join(_BLOCKED_KEYWORDS) + r")\b", re.IGNORECASE
+)
+
+# The only table this tool is meant to expose. Any other identifier used as a
+# FROM/JOIN target is rejected — this is an allowlist, not a blocklist, so it
+# can't be bypassed by a DuckDB table function or file shorthand we forgot to
+# name (e.g. `parquet_scan(...)`, `sqlite_scan(...)`, `FROM '/etc/passwd'`).
+_ALLOWED_TABLE = "churn"
+
+_FROM_JOIN_KEYWORD = re.compile(r"\b(?:FROM|JOIN)\s+", re.IGNORECASE)
+_CTE_NAME_PATTERN = re.compile(r"(\w+)\s+AS\s*\(", re.IGNORECASE)
+_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?")
+
+
+def _validate_from_targets(body: str) -> str | None:
+    """Return an error message if any FROM/JOIN target isn't `churn` or a CTE."""
+    allowed = {_ALLOWED_TABLE} | {m.lower() for m in _CTE_NAME_PATTERN.findall(body)}
+
+    for kw_match in _FROM_JOIN_KEYWORD.finditer(body):
+        rest = body[kw_match.end():]
+        if not rest or rest[0] in ("'", '"'):
+            return "table references must be plain identifiers, not string literals"
+        if rest[0] == "(":
+            continue  # subquery — its own FROM/JOIN targets are checked separately
+
+        id_match = _IDENTIFIER_PATTERN.match(rest)
+        if not id_match:
+            return "could not parse table reference"
+
+        identifier = id_match.group(0)
+        after = rest[id_match.end():].lstrip()
+        if after.startswith("("):
+            return f"table functions are not allowed: {identifier}"
+        if identifier.lower() not in allowed:
+            return f"unknown table: {identifier}"
+
+    return None
+
+
+def _validate_select_only(query: str) -> str | None:
+    """Return an error message if `query` isn't a safe, single SELECT statement."""
+    stripped = query.strip()
+    if not stripped:
+        return "empty query"
+
+    body = stripped[:-1].strip() if stripped.endswith(";") else stripped
+    if ";" in body:
+        return "only a single statement is allowed"
+
+    if not re.match(r"^(SELECT|WITH)\b", body, re.IGNORECASE):
+        return "only SELECT statements are allowed"
+
+    match = _KEYWORD_PATTERN.search(body)
+    if match:
+        return f"disallowed keyword: {match.group(1)}"
+
+    return _validate_from_targets(body)
 
 # Lazy-loaded singletons
 _con = None
@@ -35,15 +110,39 @@ def _get_collection():
     return _collection
 
 
-def sql_query(query: str) -> str:
-    """Execute a SQL query against the churn DuckDB table and return markdown."""
+def sql_query(
+    query: str,
+    row_cap: int = DEFAULT_ROW_CAP,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+) -> str:
+    """Execute a read-only SELECT query against the churn DuckDB table and return markdown."""
+    error = _validate_select_only(query)
+    if error:
+        return f"SQL validation error: {error}"
+
+    con = _get_con()
+    timer = threading.Timer(timeout_seconds, con.interrupt)
+    timer.start()
     try:
-        df = _get_con().execute(query).fetchdf()
-        if df.empty:
-            return "Query returned no rows."
-        return df.to_markdown(index=False)
+        df = con.execute(query).fetchdf()
+    except duckdb.InterruptException:
+        return f"SQL error: query timed out after {timeout_seconds}s"
     except Exception as e:
         return f"SQL error: {e}"
+    finally:
+        timer.cancel()
+
+    if df.empty:
+        return "Query returned no rows."
+
+    truncated = len(df) > row_cap
+    if truncated:
+        df = df.head(row_cap)
+
+    table = df.to_markdown(index=False)
+    if truncated:
+        table += f"\n\n_Results truncated to {row_cap} rows._"
+    return table
 
 
 def semantic_search(query: str, n_results: int = 5) -> str:
